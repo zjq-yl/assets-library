@@ -8,6 +8,8 @@ import type {
 } from "@/shared/contracts";
 import { apiV1ErrorCodeSchema } from "@/shared/contracts";
 import { userIdSchema } from "@/shared/contracts";
+import { callContext, captureRequestBody } from "@/server/observability/context";
+import { observe } from "@/server/observability/trace";
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 
@@ -88,19 +90,36 @@ export async function withApiV1(
   authorize: (request: Request) => void = () => undefined,
 ) {
   const id = requestId(request);
-  try {
+  const url = new URL(request.url);
+  const execute = async () => { try {
     authorize(request);
     const response = await handler();
     const headers = new Headers(response.headers);
     headers.set("x-request-id", id);
+    const traceId = callContext.getStore()?.traceId;
+    if (traceId) headers.set("x-trace-id", traceId);
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers,
     });
   } catch (error) {
-    return apiV1ErrorResponse(error, id);
+    const response = apiV1ErrorResponse(error, id);
+    const traceId = callContext.getStore()?.traceId;
+    if (traceId) response.headers.set("x-trace-id", traceId);
+    return response;
+  } };
+  // 排除监控的查询接口，包含其内部服务函数，避免轮询产生无限观测噪声。
+  if (url.pathname.startsWith("/api/v1/monitor/") ||
+    (request.method === "GET" && (url.pathname === "/api/v1/tasks" || /\/tasks\/[^/]+\/(monitor|logs)$/.test(url.pathname)))) {
+    return callContext.run(null, execute);
   }
+  const taskId = url.pathname.match(/\/(?:tasks|uploads)\/([0-9a-f-]{36})(?:\/|$)/i)?.[1] ?? null;
+  return observe(`${request.method} ${url.pathname}`, {
+    method: request.method, path: url.pathname,
+    query: Object.fromEntries(url.searchParams), headers: Object.fromEntries(request.headers),
+    request_id: id, body: request.body ? { capture: "JSON 由参数解析记录；媒体流仅记录类型和长度。" } : null,
+  }, execute, { kind: "api", taskId });
 }
 
 export async function parseJson<T>(request: Request, schema: ZodType<T>) {
@@ -123,7 +142,9 @@ export async function parseJson<T>(request: Request, schema: ZodType<T>) {
       );
     }
     value = JSON.parse(text);
+    captureRequestBody(value);
   } catch (error) {
+    captureRequestBody({ invalid_json: true });
     if (error instanceof ApiV1Error) throw error;
     throw new ApiV1Error("invalid_request", "请求体必须是有效的 JSON。", 400);
   }
@@ -145,7 +166,9 @@ export async function parseOptionalJson<T>(
     );
   }
   try {
-    return schema.parse(JSON.parse(text));
+    const value = JSON.parse(text);
+    captureRequestBody(value);
+    return schema.parse(value);
   } catch (error) {
     if (error instanceof ZodError) throw error;
     throw new ApiV1Error("invalid_request", "请求体必须是有效的 JSON。", 400);

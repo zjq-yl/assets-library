@@ -43,6 +43,8 @@ const applicationTables = [
   "asset_tag_rejections",
   "asset_tags",
   "assets",
+  "call_logs",
+  "call_spans",
   "callback_deliveries",
   "idempotency_requests",
   "jobs",
@@ -52,6 +54,7 @@ const applicationTables = [
   "tags",
   "task_item_segments",
   "task_items",
+  "task_logs",
   "tasks",
   "video_sources",
 ] as const;

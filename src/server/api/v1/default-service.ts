@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "@/server/db";
-import { assets, jobs, tasks } from "@/server/db/schema";
+import { assets, jobs, taskLogs, tasks } from "@/server/db/schema";
+import { appendTaskLog, redact, taskLogValues } from "@/server/services/task-observability";
+import { taskTraceFields } from "@/server/observability/context";
 import { ApiV1Error } from "@/server/api/errors";
 import type {
   ApiV1Service,
@@ -87,6 +89,7 @@ function apiStatus(status: string): ApiTaskStatus {
 
 function apiPhase(phase: string, status: string): ApiTaskPhase {
   const phases = new Set<ApiTaskPhase>([
+    "matching",
     "receiving",
     "waiting_for_seal",
     "validating",
@@ -499,12 +502,14 @@ async function createMutationTask(
           : "retrying";
   await db.transaction(async (tx) => {
     await tx.insert(tasks).values({
+      ...taskTraceFields(),
       id,
       type,
       status: "queued",
       phase,
       userId: context.user_id,
       callbackUrl: context.callback_url,
+      input: redact({ asset_id: assetId, ...context, ...payload }) as Record<string, unknown>,
       totalItems: 1,
       expiresAt: new Date(now.getTime() + taskRetentionMs()),
       createdAt: now,
@@ -520,6 +525,7 @@ async function createMutationTask(
       createdAt: now,
       updatedAt: now,
     });
+    await tx.insert(taskLogs).values(taskLogValues(id, phase, "操作已接收，等待 worker。"));
   });
   return accepted(await taskResponse(id));
 }
@@ -566,8 +572,10 @@ export class DefaultApiV1Service implements ApiV1Service {
       callbackUrl: input.callback_url,
       expiresAt,
       result: { auto_publish: input.auto_publish },
+      input: redact(input) as Record<string, unknown>,
       items: manifests,
     });
+    await appendTaskLog(taskId, "receiving", `上传清单已创建，共 ${manifests.length} 个文件，等待接收。`, { total_items: manifests.length, total_bytes: totalBytes });
     return taskResponse(taskId);
   }
 
@@ -583,6 +591,7 @@ export class DefaultApiV1Service implements ApiV1Service {
         return taskResponse(input.taskId);
       }
       leaseAcquired = true;
+      await appendTaskLog(input.taskId, "receiving", "开始接收上传文件。", { item_id: input.itemId, content_type: input.contentType, content_length: input.contentLength });
       const { item } = lease;
       if (input.contentLength !== null && input.contentLength !== item.totalBytes) {
         throw new ApiV1Error(
@@ -603,8 +612,10 @@ export class DefaultApiV1Service implements ApiV1Service {
         completed: true,
       });
       leaseAcquired = false;
+      await appendTaskLog(input.taskId, "waiting_for_seal", "文件接收完成。", { item_id: input.itemId, received_bytes: received });
       return taskResponse(input.taskId);
     } catch (error) {
+      await appendTaskLog(input.taskId, "receiving", "文件上传失败。", { item_id: input.itemId, error: error instanceof Error ? error.message : String(error) }, "error");
       if (leaseAcquired) {
         // 先确认租约仍有效，再删文件；如完成事务已提交，则不误删成品。
         const released = await releaseTaskItemUploadLease({
@@ -621,6 +632,7 @@ export class DefaultApiV1Service implements ApiV1Service {
 
   async sealUploadTask(taskId: string) {
     await sealTaskIfComplete(taskId);
+    await appendTaskLog(taskId, "validating", "上传任务已封存，等待校验处理。");
     return taskResponse(taskId);
   }
 

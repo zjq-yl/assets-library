@@ -22,6 +22,20 @@
       "when": 1786532495206,
       "tag": "0002_video-thumbnails",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1792036129125,
+      "tag": "0003_task-monitor-match",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1792045381005,
+      "tag": "0004_unified-call-monitor",
+      "breakpoints": true
     }
   ]
 }

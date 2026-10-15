@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { eq } from "drizzle-orm";
 import { db } from "@/server/db";
+import { appendTaskLog } from "./task-observability";
 import { apiTaskErrorPayload } from "@/server/api/v1/default-service";
 import { assets, callbackDeliveries, taskItems, tasks } from "@/server/db/schema";
 import {
@@ -101,6 +102,7 @@ export async function processCallbackJob(job: ClaimedJob) {
     startedAt,
   });
   try {
+    await appendTaskLog(task.id, "notifying", `开始第 ${job.attempt} 次回调投递。`, { attempt: job.attempt });
     const response = await fetch(task.callbackUrl, {
       method: "POST",
       headers: {
@@ -116,6 +118,7 @@ export async function processCallbackJob(job: ClaimedJob) {
       0,
       maximumResponseCharacters,
     );
+    await db.update(callbackDeliveries).set({ responseStatus: response.status, responseBody }).where(eq(callbackDeliveries.id, deliveryId));
     if (!response.ok) throw new Error(`回调返回 HTTP ${response.status}。`);
     const now = new Date();
     await db.transaction(async (tx) => {
@@ -138,8 +141,10 @@ export async function processCallbackJob(job: ClaimedJob) {
         .where(eq(tasks.id, task.id));
     });
     await completeJob(job);
+    await appendTaskLog(task.id, "notifying", `回调投递成功，HTTP ${response.status}。`, { attempt: job.attempt, status_code: response.status });
   } catch (error) {
     const message = error instanceof Error ? error.message : "回调投递失败。";
+    await appendTaskLog(task.id, "notifying", message, { attempt: job.attempt }, job.attempt < maximumAttempts ? "warn" : "error");
     const now = new Date();
     await db
       .update(callbackDeliveries)
@@ -156,6 +161,7 @@ export async function processCallbackJob(job: ClaimedJob) {
         })
         .where(eq(tasks.id, task.id));
       await requeueJob(job, delayMs);
+      await appendTaskLog(task.id, "notifying", "回调已安排重试。", { attempt: job.attempt, delay_ms: delayMs }, "warn");
     } else {
       await db
         .update(tasks)

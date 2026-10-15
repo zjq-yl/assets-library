@@ -10,6 +10,8 @@ import {
 } from "@/server/scene/batch";
 import { SceneDetectClient } from "@/server/scene/client";
 import { ScenePipelineError } from "@/server/scene/types";
+import { logTaskStep } from "@/server/services/task-observability";
+vi.mock("@/server/services/task-observability", () => ({ logTaskStep: vi.fn() }));
 
 const execFileAsync = promisify(execFile);
 
@@ -73,6 +75,7 @@ describe("scene video pipeline", () => {
   let parentPath: string;
 
   beforeEach(async () => {
+    vi.mocked(logTaskStep).mockClear();
     directory = await fs.mkdtemp(path.join(os.tmpdir(), "asset-scenes-"));
     parentPath = path.join(directory, "parent.mp4");
     await createVideo(parentPath);
@@ -129,6 +132,10 @@ describe("scene video pipeline", () => {
     });
 
     expect(batch.segments).toHaveLength(2);
+    const messages = vi.mocked(logTaskStep).mock.calls.map(([, message]) => message);
+    expect(messages).toContain("分镜服务处理完成，生成 2 个片段。");
+    expect(messages).toContain("片段 2 校验完成，缩略图已生成。");
+    expect(messages.at(-1)).toBe("全部分镜片段准备完成，等待持久化。");
     expect(batch.segments.map((segment) => segment.sizeBytes)).toEqual(
       bytes.map((item) => item.byteLength),
     );
@@ -217,6 +224,9 @@ describe("scene video pipeline", () => {
     );
 
     expect(error.code).toBe("scene_segment_invalid");
+    const messages = vi.mocked(logTaskStep).mock.calls.map(([, message]) => message);
+    expect(messages.some(message => message.startsWith("片段 2 处理失败："))).toBe(true);
+    expect(messages).not.toContain("全部分镜片段准备完成，等待持久化。");
     expect(error.details.segments).toEqual([
       expect.objectContaining({ segmentIndex: 2 }),
     ]);

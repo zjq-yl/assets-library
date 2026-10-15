@@ -25,6 +25,7 @@ import {
 import type { ObjectStorage } from "@/server/storage/object-storage";
 import { createZosObjectStorage } from "@/server/storage/zos";
 import type { AssetEdit } from "@/shared/contracts";
+import { logTaskStep } from "./task-observability";
 
 function stringPayload(job: ClaimedJob, key: string) {
   const value = job.payload?.[key];
@@ -356,22 +357,28 @@ export async function processMutationJob(
   try {
     await markMutationRunning(job);
     if (job.type === "retry") {
+      await logTaskStep("retrying", "开始重新安排素材分析。", { asset_id: assetId });
       await queueRetryAnalysis(job);
+      await logTaskStep("retrying", "新的分析作业已进入队列。", { asset_id: assetId });
       return;
     }
     let result: Record<string, unknown>;
     if (job.type === "update") {
+      await logTaskStep("updating", "开始更新素材名称、描述和标签。", { asset_id: assetId });
       await updateAssetMetadata(assetId, updatePayload(job), scopeForJob(job));
       result = { asset_id: assetId };
     } else if (job.type === "publish") {
+      await logTaskStep("publishing", "开始审核并发布素材。", { asset_id: assetId });
       await publishAsset(assetId, scopeForJob(job));
       result = { asset_id: assetId, review_status: "published" };
     } else if (job.type === "delete") {
+      await logTaskStep("deleting", "开始处理素材删除及关联资源回收。", { asset_id: assetId });
       result = { asset_id: assetId, ...(await deleteAsset(job, storage)) };
     } else {
       throw new AppError("invalid_request", `不支持的变更作业：${job.type}`, 500);
     }
     await finishMutationTask(job.taskId, result);
+    await logTaskStep("finished", "素材变更已完成。", result);
     await completeJob(job);
   } catch (error) {
     await failMutationTask(job.taskId, error);

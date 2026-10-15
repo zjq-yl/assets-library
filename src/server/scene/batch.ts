@@ -5,6 +5,8 @@ import { validateVideoFile } from "@/server/media/video-validation";
 import { extractVideoFirstFrame } from "@/server/media/video-frames";
 import type { MediaTargetFormat } from "@/server/media/target-format";
 import { SceneDetectClient } from "./client";
+import { logTaskStep } from "@/server/services/task-observability";
+import { errorSummary } from "@/shared/log-message";
 import {
   ScenePipelineError,
   type SceneSegment,
@@ -72,11 +74,13 @@ export async function prepareSceneBatch(
 
   try {
     await fs.mkdir(segmentsPath, { recursive: true });
+    await logTaskStep("splitting", "向分镜服务提交视频，等待分镜结果。", { filename: input.originalFilename, batch_id: batchId });
     manifest = await input.client.splitVideo(
       input.normalizedParentPath,
       input.originalFilename,
       input.signal,
     );
+    await logTaskStep("splitting", `分镜服务处理完成，生成 ${manifest.segments.length} 个片段。`, { service_task_id: manifest.taskId, segment_count: manifest.segments.length, duration_seconds: manifest.durationSeconds });
 
     const tooLarge = oversizeSegments(manifest, input.maximumSegmentBytes);
     if (tooLarge.length > 0) {
@@ -95,6 +99,7 @@ export async function prepareSceneBatch(
         `segment-${String(segment.index).padStart(3, "0")}.mp4`,
       );
       try {
+        await logTaskStep("splitting", `开始下载并校验片段 ${segment.index}。`, { segment_index: segment.index, service_task_id: manifest.taskId });
         const download = await input.client.downloadSegment(
           manifest,
           segment,
@@ -123,7 +128,9 @@ export async function prepareSceneBatch(
           thumbnailAbsolutePath,
           thumbnailSizeBytes: thumbnail.sizeBytes,
         });
+        await logTaskStep("splitting", `片段 ${segment.index} 校验完成，缩略图已生成。`, { segment_index: segment.index, size_bytes: validated.sizeBytes });
       } catch (error) {
+        await logTaskStep("splitting", `片段 ${segment.index} 处理失败：${errorSummary(error)}`, { segment_index: segment.index }, "error");
         invalid.push({
           segmentIndex: segment.index,
           code:
@@ -144,6 +151,7 @@ export async function prepareSceneBatch(
       );
     }
 
+    await logTaskStep("splitting", "全部分镜片段准备完成，等待持久化。", { segment_count: downloaded.length });
     return {
       batchId,
       serviceTaskId: manifest.taskId,
@@ -153,6 +161,7 @@ export async function prepareSceneBatch(
       segments: downloaded,
     };
   } catch (error) {
+    await logTaskStep("splitting", `分镜批次失败，开始清理临时文件：${errorSummary(error)}`, { batch_id: batchId }, "error");
     await fs.rm(workspacePath, { recursive: true, force: true });
     if (manifest) await input.client.deleteTask(manifest.taskId, input.signal);
     throw error;

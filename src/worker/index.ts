@@ -12,6 +12,7 @@ import {
   expireAbandonedUploadTasks,
 } from "@/server/services/staging-cleanup";
 import { reconcileActiveTaskLifecycles } from "@/server/services/task-lifecycle";
+import { deleteExpiredCalls } from "@/server/observability/store";
 
 const pollIntervalMs = 1_000;
 const recoveryIntervalMs = 30_000;
@@ -50,6 +51,7 @@ async function main() {
     expireAbandonedUploadTasks(),
     deleteExpiredTasks(),
     reconcileActiveTaskLifecycles(),
+    deleteExpiredCalls(),
   ]);
   const cleanupTimer = setInterval(() => {
     void Promise.all([
@@ -57,6 +59,7 @@ async function main() {
       expireAbandonedUploadTasks(),
       deleteExpiredTasks(),
       reconcileActiveTaskLifecycles(),
+      deleteExpiredCalls(),
     ])
       .then(([removedFiles, expiredUploads, removedTasks, reconciledTasks]) => {
         if (removedFiles > 0) {

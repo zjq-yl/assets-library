@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { logTaskStep } from "@/server/services/task-observability";
 import {
   loadConfig,
   type AppConfig,
@@ -204,6 +205,7 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
   async analyze(input: AnalyzeInput): Promise<AnalysisOutcome> {
     const configuredCandidates = this.config.models.vlmCandidates;
     if (configuredCandidates.length === 0) {
+      await logTaskStep("analyzing", "模型分析中止：未配置可用的视觉模型。", { code: "model_not_configured" }, "error");
       throw new AppError("model_not_configured");
     }
     const media = await mediaContent(
@@ -216,6 +218,7 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
 
     for (const candidate of candidates) {
       try {
+        await logTaskStep("analyzing", `开始尝试模型 ${candidate.name}。`, { model: candidate.name, protocol: candidate.protocol });
         const result = await this.analyzeWithModel(candidate, input, media);
         this.cooldowns.clear(candidate);
         return {
@@ -225,9 +228,11 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
       } catch (error) {
         if (error instanceof ModelRequestError) {
           if (error.kind === "fatal") {
+            await logTaskStep("analyzing", "模型请求发生不可重试错误，停止分析。", { model: candidate.name, kind: error.kind }, "error");
             throw new AppError("model_request_failed");
           }
           lastFailure = "request";
+          await logTaskStep("analyzing", "当前模型请求失败，继续检查备用模型。", { model: candidate.name, kind: error.kind }, "warn");
           this.cooldowns.mark(
             candidate,
             this.cooldownDuration(error.kind),
@@ -237,6 +242,7 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
         }
         if (error instanceof AppError && error.code === "model_response_invalid") {
           lastFailure = "response";
+          await logTaskStep("analyzing", "当前模型响应校验失败，继续检查备用模型。", { model: candidate.name }, "warn");
           this.cooldowns.mark(
             candidate,
             this.transientCooldownDuration(),
@@ -263,9 +269,11 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
     let correction: string | undefined;
     let correctionUsed = false;
     let retriesRemaining = this.config.VLM_RETRY_COUNT;
+    let attempt = 0;
 
     while (true) {
       try {
+        await logTaskStep("analyzing", `向模型 ${model.name} 发送第 ${++attempt} 次请求。`, { model: model.name, attempt, correction: Boolean(correction) });
         const text = await this.requestModel(model, input, media, correction);
         try {
           return requireChineseLabels(
@@ -274,6 +282,7 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
         } catch (error) {
           if (correctionUsed) throw new AppError("model_response_invalid");
           correctionUsed = true;
+          await logTaskStep("analyzing", "模型响应格式或标签不符合要求，准备请求修正。", { model: model.name }, "warn");
           correction =
             error instanceof Error
               ? error.message.slice(0, 500)
@@ -296,6 +305,7 @@ export class OpenAICompatibleAnalyzer implements MultimodalAnalyzer {
         }
         retriesRemaining -= 1;
         const retryDelay = Math.min(requestError.retryAfterMs ?? 0, 5_000);
+        await logTaskStep("analyzing", "模型请求暂时失败，准备重试。", { model: model.name, delay_ms: retryDelay, retries_remaining: retriesRemaining }, "warn");
         if (retryDelay > 0) await this.sleep(retryDelay);
       }
     }

@@ -32,6 +32,7 @@ import {
 import type { ObjectStorage, StoredObject } from "@/server/storage/object-storage";
 import { createZosObjectStorage } from "@/server/storage/zos";
 import { loadConfig, type AppConfig } from "@/server/config";
+import { logTaskStep } from "./task-observability";
 
 interface UploadContext {
   task: typeof tasks.$inferSelect;
@@ -44,19 +45,6 @@ export interface UploadPipelineDependencies {
   storage: ObjectStorage;
   sceneClient: SceneDetectClient;
   now: () => Date;
-}
-
-function defaultDependencies(): UploadPipelineDependencies {
-  const config = loadConfig();
-  return {
-    config,
-    storage: createZosObjectStorage(config),
-    sceneClient: new SceneDetectClient({
-      baseUrl: config.SCENE_DETECT_BASE_URL,
-      timeoutMs: config.SCENE_DETECT_TIMEOUT_MS,
-    }),
-    now: () => new Date(),
-  };
 }
 
 function taskItemId(job: ClaimedJob) {
@@ -150,6 +138,7 @@ async function processImage(
   validated: Awaited<ReturnType<typeof validateMediaFile>>,
   dependencies: UploadPipelineDependencies,
 ) {
+  await markTaskItemRunning(context.task.id, context.item.id, "persisting");
   const now = dependencies.now();
   const assetId = crypto.randomUUID();
   const mediaObjectId = crypto.randomUUID();
@@ -220,6 +209,7 @@ async function processImage(
         })
         .where(eq(taskItems.id, context.item.id));
     });
+    await logTaskStep("persisting", "图片及素材记录已保存，分析作业已加入队列。", { item_id: context.item.id, asset_id: assetId });
   } catch (error) {
     await dependencies.storage.deleteObject(stored.key).catch(() => undefined);
     throw error;
@@ -232,6 +222,7 @@ async function processVideo(
   dependencies: UploadPipelineDependencies,
 ) {
   if (!dependencies.config.SCENE_DETECT_ENABLED) {
+    await logTaskStep("splitting", "视频处理中止：分镜服务未启用。", { item_id: context.item.id }, "error");
     throw new ScenePipelineError(
       "scene_service_unavailable",
       "视频分镜服务未启用。",
@@ -396,12 +387,21 @@ async function processVideo(
 /** 处理封存后的单个文件；上传成功后本地 staging 文件会立即回收。 */
 export async function processValidateJob(
   job: ClaimedJob,
-  dependencies: UploadPipelineDependencies = defaultDependencies(),
+  options: Partial<UploadPipelineDependencies> = {},
 ) {
   let context: UploadContext | undefined;
   try {
     context = await uploadContext(job);
+    // 依赖初始化也属于本文件的处理过程，失败必须同步结束 item 和 task。
+    const config = options.config ?? loadConfig();
+    const dependencies: UploadPipelineDependencies = {
+      config,
+      storage: options.storage ?? createZosObjectStorage(config),
+      sceneClient: options.sceneClient ?? new SceneDetectClient({ baseUrl: config.SCENE_DETECT_BASE_URL, timeoutMs: config.SCENE_DETECT_TIMEOUT_MS }),
+      now: options.now ?? (() => new Date()),
+    };
     if (await alreadyPersisted(context.item.id)) {
+      await logTaskStep("persisting", "检测到已持久化的素材，复用结果并跳过重复写入。", { item_id: context.item.id });
       await removeStagingFile(stagingPath(context, dependencies));
       await completeJob(job);
       await markTaskItemPersisted(context.task.id, context.item.id);
@@ -412,6 +412,7 @@ export async function processValidateJob(
       stagingPath(context, dependencies),
       context.item.filename,
     );
+    await logTaskStep("validating", "文件校验完成。", { item_id: context.item.id, filename: context.item.filename, media_type: validated.mediaType, size_bytes: validated.sizeBytes });
     if (validated.mediaType === "image") {
       await processImage(job, context, validated, dependencies);
     } else {

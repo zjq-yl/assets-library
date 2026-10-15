@@ -23,12 +23,14 @@ import type {
 } from "@/server/storage/object-storage";
 
 const execFileAsync = promisify(execFile);
+vi.unmock("@/server/observability/store");
 const semanticSearchEnabledMock = vi.hoisted(() => vi.fn(() => false));
+const searchAnalysisMock = vi.hoisted(() => vi.fn(async (): Promise<Map<string, number>> => new Map()));
 
 vi.mock("@/server/search/chroma", () => ({
   semanticSearchEnabled: semanticSearchEnabledMock,
   indexAnalysis: vi.fn(async () => undefined),
-  searchAnalysis: vi.fn(async () => new Map()),
+  searchAnalysis: searchAnalysisMock,
   deleteAnalysis: vi.fn(async () => undefined),
 }));
 
@@ -47,6 +49,8 @@ const applicationTables = [
   "asset_tags",
   "assets",
   "callback_deliveries",
+  "call_logs",
+  "call_spans",
   "idempotency_requests",
   "jobs",
   "media_objects",
@@ -55,6 +59,7 @@ const applicationTables = [
   "tags",
   "task_item_segments",
   "task_items",
+  "task_logs",
   "tasks",
   "video_sources",
 ] as const;
@@ -297,6 +302,8 @@ mysqlPipeline("API v1 完整媒体管线", () => {
   }, 30_000);
 
   beforeEach(async () => {
+    semanticSearchEnabledMock.mockReturnValue(false);
+    searchAnalysisMock.mockResolvedValue(new Map());
     storage = new MemoryObjectStorage();
     await truncateApplicationTables(database.pool);
     await fs.rm(process.env.MEDIA_ROOT!, { recursive: true, force: true });
@@ -310,6 +317,79 @@ mysqlPipeline("API v1 完整媒体管线", () => {
   afterAll(async () => {
     if (database?.pool) await database.pool.end();
     if (temporaryRoot) await fs.rm(temporaryRoot, { recursive: true, force: true });
+  });
+
+  test("匹配任务完成后可查询入参出参和增量日志，任务删除级联清理日志", async () => {
+    const { createMatchTask, processMatchJob } = await import("@/server/services/match");
+    const { getMonitorDetail, getTaskLogs, listMonitorTasks } = await import("@/server/services/task-monitor");
+    const { matchRequestSchema, monitorQuerySchema, taskLogQuerySchema } = await import("@/shared/monitor-contracts");
+    semanticSearchEnabledMock.mockReturnValue(true);
+    const created = await createMatchTask(matchRequestSchema.parse({ query: "海边汽车", filter: { user_scope: { mode: "user", user_id: "match-user" } } }));
+    expect(created).toMatchObject({ task_type: "match", status: "queued", phase: "matching" });
+    const claimed = await repository.claimNextJob();
+    expect(claimed?.type).toBe("match");
+    await processMatchJob(claimed!);
+    const detail = await getMonitorDetail(created.task_id);
+    expect(detail.input).toMatchObject({ query: "海边汽车" });
+    expect(detail.output).toMatchObject({ status: "done", result: { items: [], matched_count: 0 } });
+    expect(detail.jobs[0]).toMatchObject({ status: "done", attempt: 1 });
+    const page = await listMonitorTasks(monitorQuerySchema.parse({ type: "match", status: "done", user_id: "match-user" }));
+    expect(page).toMatchObject({ total: 1, counts: { done: 1, failed: 0 } });
+    const first = await getTaskLogs(created.task_id, taskLogQuerySchema.parse({ limit: 1 }));
+    expect(first.has_more).toBe(true);
+    const rest = await getTaskLogs(created.task_id, taskLogQuerySchema.parse({ after: first.next_after }));
+    expect(rest.items.every((log) => log.id > first.next_after)).toBe(true);
+    expect(rest.items.at(-1)?.message).toContain("匹配完成");
+    await database.db.delete(schema.tasks).where(eq(schema.tasks.id, created.task_id));
+    expect(await database.db.select().from(schema.taskLogs)).toHaveLength(0);
+    await expect(getMonitorDetail(created.task_id)).rejects.toMatchObject({ status: 404 });
+  });
+
+  test("匹配依赖失败持久化错误，旧租约不得覆盖恢复后的任务", async () => {
+    const { createMatchTask, processMatchJob } = await import("@/server/services/match");
+    const { getMonitorDetail, getTaskLogs } = await import("@/server/services/task-monitor");
+    const { matchRequestSchema, taskLogQuerySchema } = await import("@/shared/monitor-contracts");
+    const created = await createMatchTask(matchRequestSchema.parse({ query: "海边" }));
+    const oldJob = await repository.claimNextJob();
+    await database.db.update(schema.jobs).set({ claimedAt: new Date(0) }).where(eq(schema.jobs.id, oldJob!.id));
+    await repository.recoverStaleJobs();
+    const newJob = await repository.claimNextJob();
+    expect(newJob?.attempt).toBe(2);
+    await processMatchJob(oldJob!);
+    expect((await getMonitorDetail(created.task_id)).task.status).toBe("queued");
+    await processMatchJob(newJob!);
+    const detail = await getMonitorDetail(created.task_id);
+    expect(detail.task).toMatchObject({ status: "failed", error: { code: "model_not_configured" } });
+    expect(detail.jobs[0].status).toBe("failed");
+    const logs = await getTaskLogs(created.task_id, taskLogQuerySchema.parse({}));
+    expect(logs.items.some((log) => log.level === "error")).toBe(true);
+  });
+
+  test("匹配先按用户、媒体和标签过滤候选，结果持久化真实素材及相似度", async () => {
+    const { createMatchTask, processMatchJob } = await import("@/server/services/match");
+    const { matchRequestSchema } = await import("@/shared/monitor-contracts");
+    const ids = Array.from({ length: 4 }, () => crypto.randomUUID());
+    const now = new Date();
+    await database.db.insert(schema.assets).values(ids.map((id, index) => ({
+      id, userId: index === 1 ? "other-user" : "match-user", name: `素材 ${index}`,
+      description: "海边汽车", mediaType: index === 2 ? "image" as const : "video" as const,
+      originalFilename: "car.mp4", originalPath: "fixture/car.mp4", mimeType: "video/mp4", sizeBytes: 1,
+      processingStatus: "completed" as const, reviewStatus: "published" as const,
+      createdAt: now, updatedAt: now,
+    })));
+    const tagId = crypto.randomUUID();
+    await database.db.insert(schema.tags).values({ id: tagId, category: "scene", value: "海边", normalizedValue: "海边", createdAt: now });
+    await database.db.insert(schema.assetTags).values(ids.slice(0, 3).map((assetId) => ({ assetId, tagId, source: "human" as const })));
+    semanticSearchEnabledMock.mockReturnValue(true);
+    searchAnalysisMock.mockResolvedValue(new Map([[ids[0], 0.9], [ids[1], 0.99]]));
+    const created = await createMatchTask(matchRequestSchema.parse({ query: "海边汽车", min_score: 0.7,
+      filter: { user_scope: { mode: "user", user_id: "match-user" }, media_types: ["video"], tags: [{ category: "scene", value: "海边" }] },
+    }));
+    await processMatchJob((await repository.claimNextJob())!);
+    expect(searchAnalysisMock).toHaveBeenCalledWith("海边汽车", 80, [ids[0]]);
+    const result = await new api.DefaultApiV1Service().getTask(created.task_id);
+    expect(result).toMatchObject({ status: "done", result: { matched_count: 1, items: [{ asset_id: ids[0], semantic_score: 0.9, user_id: "match-user" }] } });
+    expect(JSON.stringify(result.result)).not.toContain(ids[1]);
   });
 
   async function createAndSeal(filename: string, bytes: Buffer) {
@@ -408,6 +488,23 @@ mysqlPipeline("API v1 完整媒体管线", () => {
     ).rejects.toThrow();
   }, 30_000);
 
+  test("对象存储初始化失败时，上传任务与文件同步失败并保留原因", async () => {
+    const image = await sharp({ create: { width: 8, height: 8, channels: 3, background: "#3388cc" } }).png().toBuffer();
+    const { service, taskId } = await createAndSeal("config-error.png", image);
+    const zos = await import("@/server/storage/zos");
+    const setup = vi.spyOn(zos, "createZosObjectStorage").mockImplementation(() => { throw new Error("测试：对象存储配置缺失"); });
+    try {
+      const job = await repository.claimNextJob();
+      await processing.processJob(job!, analyzer);
+      const status = await service.getTask(taskId);
+      expect(status).toMatchObject({ status: "failed", failed_items: 1, progress_percent: 100 });
+      expect(status.items[0]).toMatchObject({ status: "failed", error: { message: "测试：对象存储配置缺失" } });
+      const { getTaskLogs } = await import("@/server/services/task-monitor");
+      const logs = await getTaskLogs(taskId, { after: 0, limit: 100 });
+      expect(logs.items.some(log => log.level === "error" && log.message.includes("对象存储配置缺失"))).toBe(true);
+    } finally { setup.mockRestore(); }
+  });
+
   test("父视频分镜为多个子素材，父视频不进 assets，每个切片独立关键帧分析", async () => {
     const mediaDirectory = path.join(temporaryRoot, "fixtures");
     await fs.mkdir(mediaDirectory, { recursive: true });
@@ -455,6 +552,20 @@ mysqlPipeline("API v1 完整媒体管线", () => {
       phase: "finished",
     });
     expect(status.items[0]!.asset_ids).toHaveLength(2);
+
+    const { getTaskLogs } = await import("@/server/services/task-monitor");
+    const logPage = await getTaskLogs(taskId, { after: 0, limit: 500 });
+    const messages = logPage.items.map(log => log.message);
+    for (const step of ["开始校验文件。", "开始视频分镜。", "分镜服务处理完成，生成 2 个片段。", "全部分镜片段准备完成，等待持久化。", "视频批次已完整保存，素材记录和分析作业已提交。", "开始调用模型分析素材。", "上传任务处理结束。"]) {
+      expect(messages).toContain(step);
+    }
+    expect(messages.some(message => message.includes("分析结果已保存"))).toBe(true);
+    expect(messages.indexOf("开始视频分镜。")).toBeLessThan(messages.indexOf("分镜服务处理完成，生成 2 个片段。"));
+    const { listCalls, callDetail } = await import("@/server/services/call-monitor");
+    const calls = await listCalls({ task_id: taskId, limit: 100, page: 1 });
+    const validation = calls.items.find(call => call.name === "processJob(validate)")!;
+    const validationLogs = await callDetail(validation.id, 0, 500);
+    expect(validationLogs.logs.some(log => log.message === "开始视频分镜。")).toBe(true);
 
     const assetRows = await database.db
       .select()

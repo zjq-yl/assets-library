@@ -1,5 +1,7 @@
 import { loadConfig } from "@/server/config";
 import type { AnalysisResult } from "@/shared/contracts";
+import { observe } from "@/server/observability/trace";
+import { logTaskStep } from "@/server/services/task-observability";
 
 type ChromaCollection = { id: string; name: string };
 const semanticSimilarityThreshold = 0.45;
@@ -43,10 +45,16 @@ async function collection() {
 }
 
 async function embed(texts: string[]) {
+  return observe("embed", { texts }, () => requestEmbeddings(texts));
+}
+
+async function requestEmbeddings(texts: string[]) {
   const config = loadConfig();
   if (!config.embeddingConfigured || !config.embeddingBaseUrl || !config.EMBEDDING_MODEL) {
+    await logTaskStep("embedding", "未配置 embedding 服务，跳过向量生成。", null, "warn");
     return [];
   }
+  await logTaskStep("embedding", "开始生成文本向量。", { text_count: texts.length, model: config.EMBEDDING_MODEL });
   const response = await fetch(`${config.embeddingBaseUrl.replace(/\/$/, "")}/embeddings`, {
     method: "POST",
     headers: {
@@ -61,6 +69,7 @@ async function embed(texts: string[]) {
   if (!vectors || vectors.length !== texts.length || vectors.some((item) => !item?.length)) {
     throw new Error("Embedding 服务返回无效向量。");
   }
+  await logTaskStep("embedding", "文本向量生成完成。", { vector_count: vectors.length, dimensions: vectors[0]?.length });
   return vectors as number[][];
 }
 
@@ -97,11 +106,16 @@ export function semanticSearchEnabled() {
 }
 
 export async function indexAnalysis(assetId: string, result: AnalysisResult) {
+  return observe("indexAnalysis", { asset_id: assetId, result }, () => writeAnalysisIndex(assetId, result));
+}
+
+async function writeAnalysisIndex(assetId: string, result: AnalysisResult) {
   const passages = analysisPassages(result).map(tokenize).filter(Boolean);
   if (!passages.length) return;
   const vectors = await embed(passages);
   if (!vectors.length) return;
   const target = await collection();
+  await logTaskStep("indexing", "开始更新素材向量索引。", { asset_id: assetId, chunk_count: passages.length });
   await chromaRequest(`/collections/${encodeURIComponent(target.id)}/delete`, {
     method: "POST",
     body: JSON.stringify({ where: { assetId } }),
@@ -115,10 +129,15 @@ export async function indexAnalysis(assetId: string, result: AnalysisResult) {
       metadatas: passages.map((_, index) => ({ assetId, chunk: index })),
     }),
   });
+  await logTaskStep("indexing", "素材向量索引更新完成。", { asset_id: assetId, chunk_count: passages.length });
 }
 
 /** 删除素材对应的全部向量分块；未启用 embedding 时无需访问 Chroma。 */
 export async function deleteAnalysis(assetId: string) {
+  return observe("deleteAnalysis", { asset_id: assetId }, () => deleteAnalysisIndex(assetId));
+}
+
+async function deleteAnalysisIndex(assetId: string) {
   if (!semanticSearchEnabled()) return;
   const target = await collection();
   await chromaRequest(`/collections/${encodeURIComponent(target.id)}/delete`, {
@@ -132,8 +151,16 @@ export async function searchAnalysis(
   limit: number,
   assetIds?: string[],
 ) {
+  return observe("searchAnalysis", { query, limit, asset_ids: assetIds }, () => queryAnalysisIndex(query, limit, assetIds));
+}
+
+async function queryAnalysisIndex(query: string, limit: number, assetIds?: string[]) {
   if (!semanticSearchEnabled()) return new Map<string, number>();
-  if (assetIds && assetIds.length === 0) return new Map<string, number>();
+  if (assetIds && assetIds.length === 0) {
+    await logTaskStep("matching", "范围和标签筛选后没有候选素材，跳过向量检索。");
+    return new Map<string, number>();
+  }
+  await logTaskStep("matching", "开始向量检索。", { candidate_count: assetIds?.length ?? null, limit });
   const vectors = await embed([tokenize(query)]);
   if (!vectors.length) return new Map<string, number>();
   const target = await collection();
@@ -161,5 +188,6 @@ export async function searchAnalysis(
       Math.max(scores.get(assetId) ?? 0, similarity),
     );
   }
+  await logTaskStep("matching", "向量检索完成。", { matched_assets: scores.size });
   return scores;
 }

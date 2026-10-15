@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/server/db";
-import { assets, jobs, taskItems, tasks } from "@/server/db/schema";
+import { assets, jobs, taskItems, taskLogs, tasks } from "@/server/db/schema";
+import { appendTaskLog, taskLogValues } from "./task-observability";
 import { AppError } from "@/server/errors";
 import { ScenePipelineError } from "@/server/scene/types";
+import { logCall } from "@/server/observability/trace";
 
 export interface PersistedTaskError {
   code: string;
@@ -45,6 +47,7 @@ export async function markTaskItemRunning(
   phase: "validating" | "splitting" | "persisting" | "analyzing",
 ) {
   const now = new Date();
+  const message = { validating: "开始校验文件。", splitting: "开始视频分镜。", persisting: "开始持久化素材。", analyzing: "素材已保存，等待模型分析。" }[phase];
   await db.transaction(async (tx) => {
     await tx
       .update(taskItems)
@@ -66,10 +69,12 @@ export async function markTaskItemRunning(
         updatedAt: now,
       })
       .where(eq(tasks.id, taskId));
+    await tx.insert(taskLogs).values(taskLogValues(taskId, phase, message, { item_id: itemId }));
   });
+  await logCall(message, { item_id: itemId, phase });
 }
 
-async function enqueueTerminalCallback(
+export async function enqueueTerminalCallback(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   taskId: string,
   now: Date,
@@ -101,6 +106,7 @@ async function enqueueTerminalCallback(
 export async function refreshUploadTask(taskId: string) {
   const now = new Date();
   await db.transaction(async (tx) => {
+    const [previous] = await tx.select({ status: tasks.status }).from(tasks).where(eq(tasks.id, taskId)).for("update");
     const rows = await tx
       .select({ status: taskItems.status, phase: taskItems.phase })
       .from(taskItems)
@@ -126,7 +132,12 @@ export async function refreshUploadTask(taskId: string) {
         updatedAt: now,
       })
       .where(eq(tasks.id, taskId));
-    if (terminal) await enqueueTerminalCallback(tx, taskId, now);
+    if (terminal) {
+      if (previous && previous.status !== "done" && previous.status !== "failed") {
+        await tx.insert(taskLogs).values(taskLogValues(taskId, "finished", "上传任务处理结束。", { done_items: doneItems, failed_items: failedItems }, failedItems ? "error" : "info"));
+      }
+      await enqueueTerminalCallback(tx, taskId, now);
+    }
   });
 }
 
@@ -137,6 +148,7 @@ export async function failTaskItem(
 ) {
   const failure = persistedTaskError(error);
   const now = new Date();
+  await appendTaskLog(taskId, "finished", failure.message, { item_id: itemId, error: failure }, "error");
   await db
     .update(taskItems)
     .set({
@@ -209,6 +221,7 @@ export async function finishMutationTask(
         updatedAt: now,
       })
       .where(eq(tasks.id, taskId));
+    await tx.insert(taskLogs).values(taskLogValues(taskId, "finished", "任务处理完成。", { result }));
     await enqueueTerminalCallback(tx, taskId, now);
   });
 }
@@ -232,6 +245,7 @@ export async function failMutationTask(taskId: string, error: unknown) {
         updatedAt: now,
       })
       .where(eq(tasks.id, taskId));
+    await tx.insert(taskLogs).values(taskLogValues(taskId, "finished", failure.message, { error: failure }, "error"));
     await enqueueTerminalCallback(tx, taskId, now);
   });
 }

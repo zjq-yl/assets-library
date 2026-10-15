@@ -24,9 +24,12 @@ import {
   mediaObjects,
   tags,
   taskItems,
+  taskLogs,
   tasks,
 } from "@/server/db/schema";
 import { AppError } from "@/server/errors";
+import { redact, taskLogValues } from "@/server/services/task-observability";
+import { taskTraceFields } from "@/server/observability/context";
 import { searchAnalysis } from "@/server/search/chroma";
 import {
   analysisResultSchema,
@@ -65,6 +68,7 @@ export interface CreateTaskManifest {
   callbackUrl?: string | null;
   expiresAt?: Date | null;
   result?: Record<string, unknown> | null;
+  input?: Record<string, unknown> | null;
   items?: TaskItemManifest[];
 }
 
@@ -91,12 +95,14 @@ export async function createMutationTask(input: CreateMutationTaskInput) {
           : "retrying";
   await db.transaction(async (tx) => {
     await tx.insert(tasks).values({
+      ...taskTraceFields(),
       id: taskId,
       type: input.type,
       status: "queued",
       phase,
       userId: input.userId?.trim() || null,
       callbackUrl: input.callbackUrl?.trim() || null,
+      input: redact({ asset_id: input.assetId, user_id: input.userId ?? null, callback_url: input.callbackUrl ?? null, ...input.payload }) as Record<string, unknown>,
       totalItems: 1,
       createdAt: now,
       updatedAt: now,
@@ -123,6 +129,7 @@ export async function createTaskWithItems(manifest: CreateTaskManifest) {
   const totalBytes = items.reduce((sum, item) => sum + item.totalBytes, 0);
   await db.transaction(async (tx) => {
     await tx.insert(tasks).values({
+      ...taskTraceFields(),
       id: manifest.id,
       type: manifest.type,
       phase: manifest.type === "upload" ? "receiving" : "queued",
@@ -132,6 +139,7 @@ export async function createTaskWithItems(manifest: CreateTaskManifest) {
       totalItems: items.length,
       expiresAt: manifest.expiresAt ?? null,
       result: manifest.result ?? null,
+      input: manifest.input ?? null,
       createdAt: now,
       updatedAt: now,
     });
@@ -150,6 +158,7 @@ export async function createTaskWithItems(manifest: CreateTaskManifest) {
         })),
       );
     }
+    await tx.insert(taskLogs).values(taskLogValues(manifest.id, "receiving", "任务及文件清单已创建。", { total_items: items.length, total_bytes: totalBytes }));
   });
   return getTaskWithItems(manifest.id);
 }
@@ -1708,6 +1717,7 @@ export async function claimNextJob(
               "publish",
               "update",
               "retry",
+              "match",
             ]),
             sql`${jobs.availableAt} <= ${now}`,
           ),

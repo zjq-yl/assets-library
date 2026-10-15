@@ -134,6 +134,25 @@ pnpm db:migrate
 服务会在终态发送与查询接口同结构的任务摘要，并记录、退避重试投递。回调目标属于内部
 可信配置，服务不会跟随 HTTP 重定向。
 
+## 素材匹配与任务监控
+
+- React 统一监控页：`/monitor`，集中显示 API、Function、Match 的调用状态、耗时、入参、出参与日志。
+- 调用详情默认显示整个任务的业务过程日志，可切换当前调用；覆盖校验、分镜、片段处理、分析/重试、入库、索引、匹配和回调等实际步骤。失败原因直接可见，列表单独显示任务结果，明暗主题与原素材库保持一致。
+- 同页的“任务进度”展示全部异步任务，`?task_id=<UUID>` 直达任务，`?span_id=<UUID>` 直达调用。
+- 按 Task ID 查看整个任务的调用；按 Trace ID 查看父子函数及跨 worker 的调用过程。
+- `POST /api/v1/match` 创建匹配任务，返回 HTTP 202 和 `task_id`。worker 复用已有
+  SQL 作用域过滤和 Chroma 语义检索；最终结果位于任务响应的 `result.items`。
+- `GET /api/v1/tasks` 支持任务类型、状态、完整任务 ID、用户 ID 和分页筛选。
+- `GET /api/v1/tasks/{task_id}/monitor` 返回入参快照、当前任务出参、作业和回调详情。
+- `GET /api/v1/tasks/{task_id}/logs?after=0&limit=100` 增量读取结构化日志。
+- `GET /api/v1/monitor/calls` 查询统一调用记录，支持 kind/status/task_id/trace_id/q 筛选。
+- `GET /api/v1/monitor/calls/{span_id}` 查看调用入参、出参、错误和增量日志。
+
+首次使用先执行 `pnpm db:migrate`，再重启 Web 和 worker。匹配依赖已配置的 embedding
+服务及 Chroma 索引；未配置时任务会明确失败，错误同样进入监控。调用与任务日志存入 MySQL，按保留期清理。
+历史任务没有入参快照或执行日志时页面会明确提示，不补造历史记录。监控沿用项目的可信
+内网边界，可查看全部任务。详见 [匹配和监控 API](docs/api.md#素材匹配与任务监控)。
+
 ## 用户与公共素材
 
 `assets.user_id IS NULL` 表示公共素材；非空表示对应用户的个人素材。`user_id` 是由上游

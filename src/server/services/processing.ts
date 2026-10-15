@@ -40,6 +40,10 @@ import {
 import { indexAnalysis, semanticSearchEnabled } from "@/server/search/chroma";
 import { SceneDetectClient } from "@/server/scene/client";
 import { processCallbackJob } from "@/server/services/callbacks";
+import { processMatchJob } from "@/server/services/match";
+import { appendTaskLog, logJobOutcome, logTaskStep } from "@/server/services/task-observability";
+import { errorSummary } from "@/shared/log-message";
+import { observe, observeJob } from "@/server/observability/trace";
 import { processMutationJob } from "@/server/services/mutation-pipeline";
 import {
   failMutationTask,
@@ -273,11 +277,12 @@ async function persistAnalysis(
         .values({ assetId, status: "queued", updatedAt: now })
         .onDuplicateKeyUpdate({ set: { status: "queued", errorMessage: null, updatedAt: now } });
     }
-    return true;
+    return { reviewStatus: asset.directPublish ? "published" : "pending_review" };
   });
 }
 
 async function failJobAndMarkAsset(job: ClaimedJob, error: unknown) {
+  await appendTaskLog(job.taskId, job.type, "素材处理失败。", { job_id: job.id, asset_id: job.assetId, error: error instanceof Error ? error.message : String(error) }, "error");
   const appError = error instanceof AppError ? error : new AppError("internal_error");
   const now = new Date();
   return db.transaction(async (tx) => {
@@ -390,8 +395,10 @@ async function processEmbeddingJob(job: ClaimedJob) {
     await completeJob(job);
   } catch (error) {
     if (job.attempt < 3) {
+      await logTaskStep("indexing", `向量索引失败，准备重试：${errorSummary(error)}`, { asset_id: job.assetId, attempt: job.attempt }, "warn");
       await requeueJob(job, job.attempt * 30_000);
     } else {
+      await logTaskStep("indexing", `向量索引失败，已达到重试上限：${errorSummary(error)}`, { asset_id: job.assetId, attempt: job.attempt }, "error");
       await db
         .insert(searchIndexState)
         .values({
@@ -438,20 +445,37 @@ async function processAnalysisJob(
     const asset = hydrated.asset;
     workspace = hydrated.workspace;
     if (!(await advanceJobAssetStatus(job, "validating"))) return;
-    const prepared = await mediaPreparer(asset);
+    await logTaskStep("validating", "开始准备分析所需的媒体文件。", { asset_id: asset.id });
+    const prepared = await observe("prepareMedia", asset, () => mediaPreparer(asset));
+    await logTaskStep("validating", "媒体准备完成。", { asset_id: asset.id, size_bytes: prepared.sizeBytes });
     await db
       .update(assets)
       .set({ mimeType: prepared.mimeType, sizeBytes: prepared.sizeBytes, updatedAt: new Date() })
       .where(eq(assets.id, asset.id));
-    if (asset.mediaType === "video") await videoFramePreparer(asset);
+    if (asset.mediaType === "video") {
+      await logTaskStep("analyzing", "开始提取视频关键帧。", { asset_id: asset.id });
+      await observe("prepareVideoFrames", asset, () => videoFramePreparer(asset));
+      await logTaskStep("analyzing", "视频关键帧提取完成。", { asset_id: asset.id });
+    }
     if (!(await advanceJobAssetStatus(job, "analyzing"))) return;
-    const outcome = await analyzer.analyze({
+    const analysisInput = {
       assetId: asset.id,
       mediaType: asset.mediaType,
       mimeType: prepared.mimeType,
       relativePath: asset.originalPath,
+    };
+    const outcome = await observe("analyzer.analyze", analysisInput, async () => {
+      await logTaskStep("analyzing", "开始调用模型分析素材。", { asset_id: asset.id, media_type: asset.mediaType });
+      const result = await analyzer.analyze(analysisInput);
+      await logTaskStep("analyzing", "模型分析完成，准备保存描述和标签。", { asset_id: asset.id, model: result.model.name });
+      return result;
     });
-    await persistAnalysis(job, outcome.result, outcome.model.protocol, outcome.model.name);
+    const saved = await persistAnalysis(job, outcome.result, outcome.model.protocol, outcome.model.name);
+    if (saved && typeof saved === "object") {
+      await logTaskStep("analyzing", saved.reviewStatus === "published" ? "分析结果已保存，素材已自动入库。" : "分析结果已保存，素材进入待入库审核。", { asset_id: asset.id, review_status: saved.reviewStatus });
+    } else {
+      await logTaskStep("analyzing", "作业租约或素材状态已变化，本次分析结果未写入。", { asset_id: asset.id }, "warn");
+    }
     await finishAnalysisLifecycle(job);
   } catch (error) {
     await failJobAndMarkAsset(job, error);
@@ -462,7 +486,14 @@ async function processAnalysisJob(
 }
 
 /** worker 的统一作业分派入口。 */
-export async function processJob(
+export async function processJob(...args: Parameters<typeof runJob>) {
+  const job = args[0];
+  return observeJob(`processJob(${job.type})`, job,
+    { job_id: job.id, task_id: job.taskId, asset_id: job.assetId, attempt: job.attempt, payload: job.payload },
+    () => runJob(...args));
+}
+
+async function runJob(
   job: ClaimedJob,
   analyzer: MultimodalAnalyzer = new OpenAICompatibleAnalyzer(),
   mediaPreparer: MediaPreparer = prepareMedia,
@@ -481,11 +512,16 @@ export async function processJob(
   }, 30_000);
   heartbeat.unref();
   try {
+    await appendTaskLog(job.taskId, job.type, `worker 开始执行 ${job.type}。`, { job_id: job.id, asset_id: job.assetId, attempt: job.attempt, input: job.payload });
+    if (job.type === "match") {
+      await processMatchJob(job);
+      return;
+    }
     if (job.type === "validate") {
       const config = loadConfig();
       await processValidateJob(job, {
         config,
-        storage: storage ?? createZosObjectStorage(config),
+        storage,
         sceneClient:
           runtime.sceneClient ??
           new SceneDetectClient({
@@ -522,9 +558,11 @@ export async function processJob(
     }
     await failJob(job);
   } catch (error) {
+    await appendTaskLog(job.taskId, job.type, "worker 作业执行异常。", { job_id: job.id, attempt: job.attempt, error: error instanceof Error ? error.message : String(error) }, "error");
     console.error(`Job ${job.id} (${job.type}) failed.`, error);
     await failJob(job);
   } finally {
     clearInterval(heartbeat);
+    await logJobOutcome(job);
   }
 }

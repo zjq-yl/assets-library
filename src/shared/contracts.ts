@@ -161,10 +161,12 @@ export const apiTaskTypeSchema = z.enum([
   "publish",
   "update",
   "retry",
+  "match",
 ]);
 export type ApiTaskType = z.infer<typeof apiTaskTypeSchema>;
 
 export const apiTaskPhaseSchema = z.enum([
+  "matching",
   "receiving",
   "waiting_for_seal",
   "validating",

@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   heartbeatJob: vi.fn().mockResolvedValue(1),
   mutation: vi.fn(),
   validate: vi.fn(),
+  match: vi.fn(),
 }));
 
 vi.mock("@/server/config", () => ({
@@ -16,6 +17,8 @@ vi.mock("@/server/config", () => ({
   }),
 }));
 vi.mock("@/server/db", () => ({ db: {} }));
+vi.mock("@/server/services/task-observability", () => ({ appendTaskLog: vi.fn(), logJobOutcome: vi.fn(), logTaskStep: vi.fn() }));
+vi.mock("@/server/services/match", () => ({ processMatchJob: mocks.match }));
 vi.mock("@/server/repositories/assets", () => ({
   completeJob: mocks.completeJob,
   failJob: mocks.failJob,
@@ -66,6 +69,12 @@ beforeEach(() => {
 });
 
 describe("worker dispatcher", () => {
+  it("把 match 作业交给素材匹配函数", async () => {
+    const claimed = job("match");
+    await processJob(claimed, analyzer, undefined, undefined, storage);
+    expect(mocks.match).toHaveBeenCalledWith(claimed);
+    expect(mocks.mutation).not.toHaveBeenCalled();
+  });
   it("把 validate 作业交给上传流水线", async () => {
     const claimed = job("validate");
     await processJob(claimed, analyzer, undefined, undefined, storage);
